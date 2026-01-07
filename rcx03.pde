@@ -1,96 +1,82 @@
+// IMPORTS
 import javax.swing.JFrame;
-import javax.swing.JComponent;
 import java.awt.Robot;
-import java.awt.Rectangle;
 import java.awt.AWTException;
-import java.awt.Toolkit;
-import java.awt.image.BufferedImage;
-import processing.core.PImage;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import processing.awt.PSurfaceAWT;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.io.File;
 import oscP5.*;
 import netP5.*;
 import controlP5.*;
 
-int cols = 32;
-int rows = 32;
-int scale = 10;
-boolean[][] grid = new boolean[cols][rows];
-boolean[][] nextGrid = new boolean[cols][rows];
-
+// FRAME SETUP
 Robot robot;
 JFrame window;
-int previousX, previousY;
-boolean isDragging = false;
 
-boolean erasing = false;
-
-boolean mouseOver = false;
-float normalizedX = 0.0;
-float normalizedY = 0.0;
-
+// GUI SETUP
 ControlP5 cp5;
 Toggle playPauseToggle;
 Toggle immortalToggle;
 Button nextStepButton, randomizeButton;
 Slider mixSlider;
 Textlabel mixLabel;
-Slider bitcrushMixSlider;
-Slider sampleRateMixSlider;
-Numberbox tempoNumberbox;
+color disabledColor = color(50); // A dark gray color
+
+// MOUSE SETUP
+int previousX, previousY;
+boolean isDragging = false;
+
+// SIM SETUP
 boolean isPlaying = true;
 boolean immortal = false;
-boolean edgeWrapped = false;
-Textlabel edgeWrapLabel;
-int tempo = 120;
-int lastUpdateTime = 0;
+int cols = 32;
+int rows = 32;
+int scale = 10;
+boolean[][] grid = new boolean[cols][rows];
+boolean[][] nextGrid = new boolean[cols][rows];
+int subdivision = 2;
+int lastIndex = 0;
 
-color disabledColor = color(50); // A dark gray color
-color bcColor = color(100, 0, 0); // A dark red 
-color srColor = color(0, 0, 100); // A dark blue color
-color bgColor = color(0, 0, 0, 0);
+// FREQ SCALE SETUP
+int[][] logMapBands = null; // [1024][2] startBin,endBin
+final float DEFAULT_SR = 44100.0; // match your Max SR if different
 
-color gridlineColor = disabledColor;
+// OSC SETUP
+OscP5 oscP5;
+NetAddress maxAddress;
 
 void setup() {
+  // FRAME SETUP
   size(320, 352, JAVA2D);
   PSurfaceAWT surf = (PSurfaceAWT) getSurface();
   PSurfaceAWT.SmoothCanvas canvas = (PSurfaceAWT.SmoothCanvas) surf.getNative();
   window = (JFrame) canvas.getFrame();
-
+  window.dispose();
+  window.setUndecorated(true);
+  window.setVisible(true);
+  window.setBackground(new java.awt.Color(255, 0, 0)); // Fully transparent background
+  window.setSize(width, height);
+  noStroke();
+  cp5 = new ControlP5(this); 
   try {
     robot = new Robot();
   } catch (AWTException e) {
     e.printStackTrace();
     exit();
   }
-
-  window.dispose();
-  window.setUndecorated(true);
-  window.setVisible(true);
-  window.setBackground(new java.awt.Color(255, 0, 0)); // Fully transparent background
-  //window.setOpacity(1f); // Slightly visible window
-  //window.setOpaque(false);
-
-  window.setSize(width, height);
-  noStroke();
   
-  cp5 = new ControlP5(this);
-  
-  // Initialize OSC communication
+  // OSC SETUP
   oscP5 = new OscP5(this, 12000); // Listening port for incoming OSC (if needed)
   maxAddress = new NetAddress("127.0.0.1", 7400); // IP and port for Max/MSP
   
+  // SIM SETUP
   randomizeGrid();
+  buildLogMap(20.0, 20000.0, 44100.0);  // or use sampleRate if dynamic
   
+  // MOUSE SETUP
   canvas.addMouseListener(new MouseAdapter() {
     public void mousePressed(MouseEvent e) {
       if(e.getY() < 50 && e.getButton() == MouseEvent.BUTTON1) {
-        println("righttt!");
         isDragging = true;
         previousX = e.getXOnScreen();
         previousY = e.getYOnScreen();
@@ -125,7 +111,7 @@ void setup() {
     }
   });
   
-  // Play/Pause Toggle Button
+  // PLAY/PAUSE TOGGLE BUTTON
   playPauseToggle = cp5.addToggle("Play/Pause")
                       .setPosition(0, 320)
                       .setSize(30, 30)
@@ -136,12 +122,11 @@ void setup() {
                       .onChange(new CallbackListener() {
                         public void controlEvent(CallbackEvent event) {
                           isPlaying = !isPlaying;
-                          lastUpdateTime = millis();
                           sendFirstColumnOSC();
                         }
                       });
                       
-  // Play/Pause Toggle Button
+  // AUTO-STEP TOGGLE BUTTON
   immortalToggle = cp5.addToggle("Immortal")
                       .setPosition(30, 320)
                       .setSize(30, 30)
@@ -155,7 +140,7 @@ void setup() {
                         }
                       });
 
-  // Next Step Button
+  // NEXT STEP BUTTON
   nextStepButton = cp5.addButton("Next Step")
                      .setPosition(60, 320)
                      .setSize(60, 30)
@@ -165,7 +150,7 @@ void setup() {
                      .onPress(new CallbackListener() {
                        public void controlEvent(CallbackEvent event) {
                          nextStepButton.setColorLabel(color(0));
-                          calculateNextGeneration();
+                         calculateNextGeneration();
                        }
                      })
                      .onRelease(new CallbackListener() {
@@ -174,7 +159,7 @@ void setup() {
                        }
                      });
 
-  // Randomize Button
+  // RANDOMIZE BUTTON (LMB = RAND, RMB = CLEAR)
   randomizeButton = cp5.addButton("Randomize")
                      .setPosition(120, 320)
                      .setSize(60, 30)
@@ -197,7 +182,7 @@ void setup() {
                        }
                      });
 
-  // Mix Slider
+  // MIX SLIDER
   mixSlider = cp5.addSlider("Mixer")
                 .setPosition(180, 320)
                 .setColorForeground(color(200))
@@ -218,6 +203,9 @@ void setup() {
              .setPosition(180, 325);
 }
 
+
+
+// GUI FUNCTIONS
 void dimSlider(Slider slider) {
   slider.setColorForeground(color(50));
   slider.setColorBackground(color(50));
@@ -232,6 +220,9 @@ void unDimSlider(Slider slider, color foregroundColor, color backgroundColor, co
   slider.setLabelVisible(true);
 }
 
+
+
+// SIM FUNCTIONS
 void randomizeGrid() {
   for (int i = 0; i < cols; i++) {
     for (int j = 0; j < rows; j++) {
@@ -274,6 +265,8 @@ void calculateNextGeneration() {
   boolean[][] temp = grid;
   grid = nextGrid;
   nextGrid = temp;
+  
+  sendFirstColumnOSC();
 }
 
 int countNeighbors(int x, int y) {
@@ -291,71 +284,43 @@ int countNeighbors(int x, int y) {
   return count;
 }
 
-OscP5 oscP5;
-NetAddress maxAddress;
 
-float playhead;
-int subdivision = 2;
-int lastIndex = 0;
-int xIndex = 0;
-int yIndex = 0;
-int lastX = 0;
-int lastY = 0;
 
-float mix = 0.0;
-
-void sendFirstColumnOSC() {
-  StringBuilder columnDataL = new StringBuilder();
-  StringBuilder columnDataR = new StringBuilder();
-  
-  if (isPlaying) {
-    for (int i = 0; i < rows; i++) {
-      for (int j = 0; j < rows; j++) {
-        columnDataL.append(grid[i][lastIndex] ? "1 " : "0 ");
-        columnDataR.append(grid[lastIndex][i] ? "1 " : "0 ");
-      }
-    }
-  } else {
-    for (int i = 0; i < rows; i++) {
-      for (int j = 0; j < rows; j++) {
-        columnDataL.append(grid[i][j] ? "1 " : "0 ");
-        columnDataR.append(grid[j][i] ? "1 " : "0 ");
-      }
-    }
-  }
-
-  OscMessage msgL = new OscMessage("/generationL");
-  OscMessage msgR = new OscMessage("/generationR");
-  
-  msgL.add(columnDataL.toString());
-  msgR.add(columnDataR.toString());
-  
-  oscP5.send(msgL, maxAddress);
-  oscP5.send(msgR, maxAddress);
-}
-
-void sendMixOSC() {
-  OscMessage msg = new OscMessage("/mix");
-
-  msg.add(mixSlider.getValue());
-
-  oscP5.send(msg, maxAddress);
-}
-
-void oscEvent(OscMessage msg) {
-  int val = floor(msg.get(0).floatValue() * cols * subdivision) % cols;
-  if(val != lastIndex) {
-    if (val == 0 && immortal) {
-        calculateNextGeneration();
-        sendFirstColumnOSC();
-    }
-    if (isPlaying) {
-      lastIndex = val;
-      sendFirstColumnOSC();
-    }
+// FREQ SCALE FUNCTIONS
+void ensureLogMap() {
+  if (logMapBands == null || logMapBands.length != 1024) {
+    // fMin 20 Hz, fMax limited by Nyquist;
+    float nyq = DEFAULT_SR / 2.0;
+    buildLogMap(20.0, min(20000.0, nyq), DEFAULT_SR);
   }
 }
 
+void buildLogMap(float fMin, float fMax, float sampleRate) {
+  float nyquist = sampleRate / 2.0;
+  float octaves = log(fMax / fMin) / log(2);
+  logMapBands = new int[1024][2];
+
+  for (int i = 0; i < 1024; i++) {
+    float p1 = i     / 1024.0;
+    float p2 = (i+1) / 1024.0;
+
+    float f1 = fMin * pow(2, p1 * octaves);
+    float f2 = fMin * pow(2, p2 * octaves);
+
+    int bin1 = round(f1 / nyquist * 1023);
+    int bin2 = round(f2 / nyquist * 1023);
+
+    // order + clamp
+    int s = constrain(min(bin1, bin2), 0, 1023);
+    int e = constrain(max(bin1, bin2), 0, 1023);
+    logMapBands[i][0] = s;
+    logMapBands[i][1] = e;
+  }
+}
+
+
+
+// DRAW FUNCTION (GRID AND RED BOTTOMLINE)
 void draw() {
   background(255, 0, 0);
   for (int i = 0; i < cols; i++) {
@@ -366,6 +331,97 @@ void draw() {
         fill(0);
       }
       rect(i * scale, j * scale, scale, scale);
+    }
+  }
+}
+
+
+
+// OSC SENDER (GRID DATA)
+void sendFirstColumnOSC() {
+  ensureLogMap();
+
+  // Gather 1024 grid cells into flat arrays (same as before)
+  boolean[] flatL = new boolean[1024];
+  boolean[] flatR = new boolean[1024];
+  int idx = 0;
+
+  if (isPlaying) {
+    // 32x32 slice (row/col @ lastIndex) → 1024 cells
+    for (int i = 0; i < rows; i++) {
+      for (int j = 0; j < rows; j++) {
+        flatL[idx] = grid[i][lastIndex];
+        flatR[idx] = grid[lastIndex][i];
+        idx++;
+      }
+    }
+  } else {
+    // full grid (row-major) and its diagonal-inverted readout
+    for (int i = 0; i < rows; i++) {
+      for (int j = 0; j < rows; j++) {
+        flatL[idx] = grid[i][j];
+        flatR[idx] = grid[j][i];
+        idx++;
+      }
+    }
+  }
+
+  // Paint bins from cells using octave-bucket bands
+  // out* are per-FFT-bin 0..1023
+  int[] outL = new int[1024];
+  int[] outR = new int[1024];
+
+  for (int cell = 0; cell < 1024; cell++) {
+    if (flatL[cell]) {
+      int s = logMapBands[cell][0], e = logMapBands[cell][1];
+      for (int b = s; b <= e; b++) outL[b] = 1;
+    }
+    if (flatR[cell]) {
+      int s = logMapBands[cell][0], e = logMapBands[cell][1];
+      for (int b = s; b <= e; b++) outR[b] = 1;
+    }
+  }
+
+  // Serialize bins in order (what Max writes into buffer indices 0..1023)
+  StringBuilder columnDataL = new StringBuilder();
+  StringBuilder columnDataR = new StringBuilder();
+  for (int b = 0; b < 1024; b++) {
+    columnDataL.append(outL[b]).append(' ');
+    columnDataR.append(outR[b]).append(' ');
+  }
+
+  OscMessage msgL = new OscMessage("/generationL");
+  OscMessage msgR = new OscMessage("/generationR");
+  msgL.add(columnDataL.toString());
+  msgR.add(columnDataR.toString());
+  oscP5.send(msgL, maxAddress);
+  oscP5.send(msgR, maxAddress);
+}
+
+
+
+// OSC SENDER (MIX)
+void sendMixOSC() {
+  OscMessage msg = new OscMessage("/mix");
+
+  msg.add(mixSlider.getValue());
+
+  oscP5.send(msg, maxAddress);
+}
+
+
+
+// OSC RECIEVER (TEMPO SYNC)
+void oscEvent(OscMessage msg) {
+  int val = floor(msg.get(0).floatValue() * cols * subdivision) % cols;
+  if(val != lastIndex) {
+    if (val == 0 && immortal) {
+        calculateNextGeneration();
+        sendFirstColumnOSC();
+    }
+    if (isPlaying) {
+      lastIndex = val;
+      sendFirstColumnOSC();
     }
   }
 }
